@@ -1,0 +1,12 @@
+Hi, boss. ✌️
+
+{% if commits|length > 1 %}There were {{ commits|length }} commit(s) that have affected the following files of the {{ project_name }} project:{% else %}There was 1 commit that has affected the following files of the {{ project_name }} project:{% endif %}
+
+{% for file in watched_files %}📄 {{ file }}
+{% endfor %}
+The commits are ordered from the most recent to the most old, this is the commit list:
+{% for commit in commits %}
+👉 {{ commit.message|truncate(50, True) }}
+{{ commit.url }}
+{{ commit.timestamp.strftime('%d/%b/%Y, %I:%M %p') }}
+{% endfor %}
