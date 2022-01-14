@@ -11,13 +11,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import List
 
-import boto3
 import jinja2
 
-from utils import console_logger, utc2datetime, datetime2utc
+from utils import console_logger, utc2datetime
 
 
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
@@ -46,42 +45,27 @@ class Commit:
             url = api_dict['html_url']
             return Commit(message, timestamp, url)
         except KeyError as e:
-            logger.exception('Seems that the Github API is not using the way '
-                             'to represent commits in JSON format they used '
-                             'to.')
+            logger.critical('Seems that the Github API is not using the way '
+                            'to represent commits in JSON format they used '
+                            'to. The key `%s` is not present in the commit '
+                            'response. GitHub response: %s', e, api_dict)
             raise e
 
 
-def get_last_check_date(s3: boto3.session.Session.resource, bucket: str,
-                        key: str) -> datetime:
-    """Retrives the last check date from a text file in an S3 bucket."""
-    try:
-        s3_obj = s3.Object(bucket, key)
-        date_str = s3_obj.get()['Body'].read().decode('UTF-8').strip()
-        return utc2datetime(date_str)
-    except Exception:
-        logger.exception('Unable to retrieve the object %s to obtain the last '
-                         ' check date, using "now" as the last check date.',
-                         f's3://{bucket}/{key}')
-        return datetime.now()
+def ok():
+    """
+    Returns a dict representing that the execution of the Lambda function was
+    successful.
+    """
+    return dict(ok=True)
 
 
-def write_check_date(check_date: datetime, s3: boto3.session.Session.resource,
-                     bucket: str, key: str):
-    """Saves the check date in iso format in a text file in an S3 bucket."""
-    check_date_str = datetime2utc(check_date)
-    object_path = f's3://{bucket}/{key}'
-    try:
-        s3_obj = s3.Object(bucket, key)
-        response = s3_obj.put(Body=check_date_str)
-        response_metadata = response.get('ResponseMetadata')
-        if response_metadata.get('HTTPStatusCode') == 200:
-            logger.info('The check date was saved successfully in %s',
-                        object_path)
-        else:
-            logger.error('Unable to save the check date in %s', object_path)
-    except Exception:
-        logger.exception('Unable to save the check date in %s', object_path)
+def error():
+    """
+    Returns a dict representing that the execution of the Lambda function was
+    unsuccessful.
+    """
+    return dict(ok=False)
 
 
 def get_github_commits(repo_url: str, files_to_watch: List[str],
@@ -94,12 +78,8 @@ def get_github_commits(repo_url: str, files_to_watch: List[str],
     params = urllib.parse.urlencode(query, doseq=True,
                                     quote_via=urllib.parse.quote)
     url = f'{repo_url}?{params}'
-    commits: List[dict] = []
-    try:
-        with urllib.request.urlopen(url) as response:
-            commits = json.loads(response.read())
-    except Exception:
-        logger.exception('Unable to retrieve the Github repository commits.')
+    with urllib.request.urlopen(url) as response:
+        commits = json.loads(response.read())
     commits = list(map(Commit.from_api_dict, commits))
     return commits
 
@@ -121,55 +101,57 @@ def send_telegram_msg(msg: str, chat_id: str, token: str):
     msg = msg.encode('ascii')
     url = f'{TELEGRAM_API_URL}{token}/sendMessage'
     request = urllib.request.Request(url=url, data=msg, method='POST')
-    try:
-        logger.info('Notifying the boss via Telegram...')
-        with urllib.request.urlopen(request) as response:
-            parsed_response = json.loads(response.read())
-            logger.info('Telegram response received: %s', parsed_response)
-            if parsed_response.get('ok'):
-                logger.info('The boss has been notified via Telegram.')
-            else:
-                logger.error('There was a problem notifying the boss via '
-                             'Telegram O_o.')
-    except urllib.error.URLError:
-        logger.exception('There was a problem sending the Telegram message!')
+    with urllib.request.urlopen(request) as response:
+        return json.loads(response.read())
 
 
-def watch_files(s3_bucket: str, s3_obj_key: str, github_repo_api_url: str,
-                files_to_watch: List[str], project_name: str,
-                telegram_msg_template: str, telegram_chat_id: str,
-                telegram_token: str):
+def watch_files(github_repo_api_url: str, files_to_watch: List[str],
+                project_name: str, telegram_msg_template: str,
+                telegram_chat_id: str, telegram_token: str,
+                check_since: datetime):
     """Orchestrates all the operation of watching files of the repository."""
-    logger.info('Retrieving the last check date from "%s"...',
-                f's3://{s3_bucket}/{s3_obj_key}')
-    s3 = boto3.resource('s3')
-    last_check_date = get_last_check_date(s3, s3_bucket, s3_obj_key)
     logger.info('Retrieving the commits that contain the files %s since: %s',
                 ','.join(files_to_watch),
-                last_check_date.strftime('%d/%b/%Y, %I:%M %p'))
+                check_since.strftime('%d/%b/%Y, %I:%M %p'))
     commits = get_github_commits(github_repo_api_url, files_to_watch,
-                                 last_check_date)
+                                 check_since)
     if not commits:
         logger.info('There are no recent commmits that include the files the '
-                    'boss is interested on.')
-        return
-    five_min_ago = datetime.now() - timedelta(minutes=5)
-    write_check_date(five_min_ago, s3, s3_bucket, s3_obj_key)
+                    'boss is interested on. No notifications will be sent.')
+        return ok()
     msg = make_telegram_msg(commits, files_to_watch, project_name,
                             telegram_msg_template)
     logger.info('Notifying about %s commit(s).', len(commits))
-    send_telegram_msg(msg, telegram_chat_id, telegram_token)
+    response = send_telegram_msg(msg, telegram_chat_id, telegram_token)
+    logger.info('Telegram response received: %s', response)
+    try:
+        if not response['ok']:
+            logger.critical('There was a problem notifying the boss via '
+                            'Telegram O_o.')
+            return error()
+        logger.info('The boss has been notified via Telegram.')
+        return ok()
+    except KeyError as e:
+        logger.critical('Seems that the Telegram API response has changed, the'
+                        'key: `%s` was not found in the JSON response '
+                        'received.')
+        raise e
 
 
 def lambda_handler(event, _context):
     """AWS Lambda funtion handler."""
-    watch_files(
-        event['s3_bucket'],
-        event['check_date_file'],
-        event['github_repo_api_url'],
-        event['files_to_watch'],
-        event['project_name'],
-        TELEGRAM_MSG_TEMPLATE_FILE,
-        event['telegram_chat_id'],
-        event['telegram_bot_token']
-    )
+    response: dict
+    try:
+        response = watch_files(
+            event['github_repo_api_url'],
+            event['files_to_watch'],
+            event['project_name'],
+            TELEGRAM_MSG_TEMPLATE_FILE,
+            event['telegram_chat_id'],
+            event['telegram_bot_token'],
+            utc2datetime(event['check_since'])
+        )
+    except Exception:
+        logger.exception('Unexpected exception occurred.')
+        response = error()
+    return response
