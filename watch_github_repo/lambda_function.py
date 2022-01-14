@@ -123,18 +123,19 @@ def watch_files(github_repo_api_url: str, files_to_watch: List[str],
                             telegram_msg_template)
     logger.info('Notifying about %s commit(s).', len(commits))
     response = send_telegram_msg(msg, telegram_chat_id, telegram_token)
-    logger.info('Telegram response received: %s', response)
     try:
         if not response['ok']:
             logger.critical('There was a problem notifying the boss via '
-                            'Telegram O_o.')
+                            'Telegram O_o, this is the Telegram response: %s',
+                            response)
             return error()
         logger.info('The boss has been notified via Telegram.')
         return ok()
     except KeyError as e:
         logger.critical('Seems that the Telegram API response has changed, the'
                         'key: `%s` was not found in the JSON response '
-                        'received.')
+                        'received. Telegram response received: %s', e,
+                        response)
         raise e
 
 
